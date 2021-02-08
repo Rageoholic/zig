@@ -375,6 +375,10 @@ pub const Scope = struct {
         }
     }
 
+    pub fn isComptime(self: *Scope) bool {
+        return self.getGenZIR().force_comptime;
+    }
+
     pub fn ownerDecl(self: *Scope) ?*Decl {
         return switch (self.tag) {
             .block => self.cast(Block).?.owner_decl,
@@ -671,13 +675,35 @@ pub const Scope = struct {
         };
 
         pub const Merges = struct {
-            results: ArrayListUnmanaged(*Inst),
             block_inst: *Inst.Block,
+            /// Separate array list from break_inst_list so that it can be passed directly
+            /// to resolvePeerTypes.
+            results: ArrayListUnmanaged(*Inst),
+            /// Keeps track of the break instructions so that the operand can be replaced
+            /// if we need to add type coercion at the end of block analysis.
+            /// Same indexes, capacity, length as `results`.
+            br_list: ArrayListUnmanaged(*Inst.Br),
         };
 
         /// For debugging purposes.
         pub fn dump(self: *Block, mod: Module) void {
             zir.dumpBlock(mod, self);
+        }
+
+        pub fn makeSubBlock(parent: *Block) Block {
+            return .{
+                .parent = parent,
+                .inst_table = parent.inst_table,
+                .func = parent.func,
+                .owner_decl = parent.owner_decl,
+                .src_decl = parent.src_decl,
+                .instructions = .{},
+                .arena = parent.arena,
+                .label = null,
+                .inlining = parent.inlining,
+                .is_comptime = parent.is_comptime,
+                .branch_quota = parent.branch_quota,
+            };
         }
     };
 
@@ -690,13 +716,32 @@ pub const Scope = struct {
         parent: *Scope,
         decl: *Decl,
         arena: *Allocator,
+        force_comptime: bool,
         /// The first N instructions in a function body ZIR are arg instructions.
         instructions: std.ArrayListUnmanaged(*zir.Inst) = .{},
         label: ?Label = null,
         break_block: ?*zir.Inst.Block = null,
         continue_block: ?*zir.Inst.Block = null,
-        /// only valid if label != null or (continue_block and break_block) != null
+        /// Only valid when setBlockResultLoc is called.
         break_result_loc: astgen.ResultLoc = undefined,
+        /// When a block has a pointer result location, here it is.
+        rl_ptr: ?*zir.Inst = null,
+        /// Keeps track of how many branches of a block did not actually
+        /// consume the result location. astgen uses this to figure out
+        /// whether to rely on break instructions or writing to the result
+        /// pointer for the result instruction.
+        rvalue_rl_count: usize = 0,
+        /// Keeps track of how many break instructions there are. When astgen is finished
+        /// with a block, it can check this against rvalue_rl_count to find out whether
+        /// the break instructions should be downgraded to break_void.
+        break_count: usize = 0,
+        /// Tracks `break :foo bar` instructions so they can possibly be elided later if
+        /// the labeled block ends up not needing a result location pointer.
+        labeled_breaks: std.ArrayListUnmanaged(*zir.Inst.Break) = .{},
+        /// Tracks `store_to_block_ptr` instructions that correspond to break instructions
+        /// so they can possibly be elided later if the labeled block ends up not needing
+        /// a result location pointer.
+        labeled_store_to_block_ptr_list: std.ArrayListUnmanaged(*zir.Inst.BinOp) = .{},
 
         pub const Label = struct {
             token: ast.TokenIndex,
@@ -968,6 +1013,7 @@ fn astGenAndAnalyzeDecl(self: *Module, decl: *Decl) !bool {
                 .decl = decl,
                 .arena = &fn_type_scope_arena.allocator,
                 .parent = &decl.container.base,
+                .force_comptime = true,
             };
             defer fn_type_scope.instructions.deinit(self.gpa);
 
@@ -1131,6 +1177,7 @@ fn astGenAndAnalyzeDecl(self: *Module, decl: *Decl) !bool {
                     .decl = decl,
                     .arena = &decl_arena.allocator,
                     .parent = &decl.container.base,
+                    .force_comptime = false,
                 };
                 defer gen_scope.instructions.deinit(self.gpa);
 
@@ -1171,7 +1218,7 @@ fn astGenAndAnalyzeDecl(self: *Module, decl: *Decl) !bool {
                     !gen_scope.instructions.items[gen_scope.instructions.items.len - 1].tag.isNoReturn())
                 {
                     const src = tree.token_locs[body_block.rbrace].start;
-                    _ = try astgen.addZIRNoOp(self, &gen_scope.base, src, .returnvoid);
+                    _ = try astgen.addZIRNoOp(self, &gen_scope.base, src, .return_void);
                 }
 
                 if (std.builtin.mode == .Debug and self.comp.verbose_ir) {
@@ -1329,6 +1376,7 @@ fn astGenAndAnalyzeDecl(self: *Module, decl: *Decl) !bool {
                     .decl = decl,
                     .arena = &gen_scope_arena.allocator,
                     .parent = &decl.container.base,
+                    .force_comptime = false,
                 };
                 defer gen_scope.instructions.deinit(self.gpa);
 
@@ -1388,6 +1436,7 @@ fn astGenAndAnalyzeDecl(self: *Module, decl: *Decl) !bool {
                     .decl = decl,
                     .arena = &type_scope_arena.allocator,
                     .parent = &decl.container.base,
+                    .force_comptime = true,
                 };
                 defer type_scope.instructions.deinit(self.gpa);
 
@@ -1457,13 +1506,15 @@ fn astGenAndAnalyzeDecl(self: *Module, decl: *Decl) !bool {
 
             decl.analysis = .in_progress;
 
-            // A comptime decl does not store any value so we can just deinit this arena after analysis is done.
+            // A comptime decl does not store any value so we can just deinit
+            // this arena after analysis is done.
             var analysis_arena = std.heap.ArenaAllocator.init(self.gpa);
             defer analysis_arena.deinit();
             var gen_scope: Scope.GenZIR = .{
                 .decl = decl,
                 .arena = &analysis_arena.allocator,
                 .parent = &decl.container.base,
+                .force_comptime = true,
             };
             defer gen_scope.instructions.deinit(self.gpa);
 
@@ -1622,7 +1673,7 @@ pub fn analyzeContainer(self: *Module, container_scope: *Scope.Container) !void 
                             // in `Decl` to notice that the line number did not change.
                             self.comp.work_queue.writeItemAssumeCapacity(.{ .update_line_number = decl });
                         },
-                        .c, .wasm => {},
+                        .c, .wasm, .spirv => {},
                     }
                 }
             } else {
@@ -1855,6 +1906,7 @@ fn allocateNewDecl(
             .macho => .{ .macho = link.File.MachO.TextBlock.empty },
             .c => .{ .c = link.File.C.DeclBlock.empty },
             .wasm => .{ .wasm = {} },
+            .spirv => .{ .spirv = {} },
         },
         .fn_link = switch (mod.comp.bin_file.tag) {
             .coff => .{ .coff = {} },
@@ -1862,6 +1914,7 @@ fn allocateNewDecl(
             .macho => .{ .macho = link.File.MachO.SrcFn.empty },
             .c => .{ .c = link.File.C.FnBlock.empty },
             .wasm => .{ .wasm = null },
+            .spirv => .{ .spirv = .{} },
         },
         .generation = 0,
         .is_pub = false,
@@ -1959,6 +2012,7 @@ pub fn analyzeExport(
             .macho => .{ .macho = link.File.MachO.Export{} },
             .c => .{ .c = {} },
             .wasm => .{ .wasm = {} },
+            .spirv => .{ .spirv = {} },
         },
         .owner_decl = owner_decl,
         .exported_decl = exported_decl,
@@ -2100,7 +2154,7 @@ pub fn addBr(
     src: usize,
     target_block: *Inst.Block,
     operand: *Inst,
-) !*Inst {
+) !*Inst.Br {
     const inst = try scope_block.arena.create(Inst.Br);
     inst.* = .{
         .base = .{
@@ -2112,7 +2166,7 @@ pub fn addBr(
         .block = target_block,
     };
     try scope_block.instructions.append(self.gpa, &inst.base);
-    return &inst.base;
+    return inst;
 }
 
 pub fn addCondBr(
@@ -2164,7 +2218,7 @@ pub fn addSwitchBr(
     self: *Module,
     block: *Scope.Block,
     src: usize,
-    target_ptr: *Inst,
+    target: *Inst,
     cases: []Inst.SwitchBr.Case,
     else_body: ir.Body,
 ) !*Inst {
@@ -2175,7 +2229,7 @@ pub fn addSwitchBr(
             .ty = Type.initTag(.noreturn),
             .src = src,
         },
-        .target_ptr = target_ptr,
+        .target = target,
         .cases = cases,
         .else_body = else_body,
     };
@@ -3466,18 +3520,18 @@ pub fn addSafetyCheck(mod: *Module, parent_block: *Scope.Block, ok: *Inst, panic
     };
 
     const ok_body: ir.Body = .{
-        .instructions = try parent_block.arena.alloc(*Inst, 1), // Only need space for the brvoid.
+        .instructions = try parent_block.arena.alloc(*Inst, 1), // Only need space for the br_void.
     };
-    const brvoid = try parent_block.arena.create(Inst.BrVoid);
-    brvoid.* = .{
+    const br_void = try parent_block.arena.create(Inst.BrVoid);
+    br_void.* = .{
         .base = .{
-            .tag = .brvoid,
+            .tag = .br_void,
             .ty = Type.initTag(.noreturn),
             .src = ok.src,
         },
         .block = block_inst,
     };
-    ok_body.instructions[0] = &brvoid.base;
+    ok_body.instructions[0] = &br_void.base;
 
     var fail_block: Scope.Block = .{
         .parent = parent_block,

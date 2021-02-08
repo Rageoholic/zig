@@ -634,12 +634,7 @@ pub fn formatIntValue(
             @compileError("Cannot print integer that is larger than 8 bits as a ascii");
         }
     } else if (comptime std.mem.eql(u8, fmt, "Z")) {
-        if (@typeInfo(@TypeOf(int_value)).Int.bits <= 8) {
-            const c: u8 = int_value;
-            return formatZigEscapes(@as(*const [1]u8, &c), options, writer);
-        } else {
-            @compileError("Cannot escape character with more than 8 bits");
-        }
+        @compileError("specifier 'Z' has been deprecated, wrap your argument in std.zig.fmtEscapes instead");
     } else if (comptime std.mem.eql(u8, fmt, "u")) {
         if (@typeInfo(@TypeOf(int_value)).Int.bits <= 21) {
             return formatUnicodeCodepoint(@as(u21, int_value), options, writer);
@@ -659,7 +654,7 @@ pub fn formatIntValue(
         radix = 8;
         uppercase = false;
     } else {
-        @compileError("Unknown format string: '" ++ fmt ++ "'");
+        @compileError("Unsupported format string '" ++ fmt ++ "' for type '" ++ @typeName(@TypeOf(value)) ++ "'");
     }
 
     return formatInt(int_value, radix, uppercase, options, writer);
@@ -686,7 +681,7 @@ fn formatFloatValue(
             else => |e| return e,
         };
     } else {
-        @compileError("Unknown format string: '" ++ fmt ++ "'");
+        @compileError("Unsupported format string '" ++ fmt ++ "' for type '" ++ @typeName(@TypeOf(value)) ++ "'");
     }
 
     return formatBuf(buf_stream.getWritten(), options, writer);
@@ -720,7 +715,7 @@ pub fn formatText(
     } else if (comptime std.mem.eql(u8, fmt, "Z")) {
         @compileError("specifier 'Z' has been deprecated, wrap your argument in std.zig.fmtEscapes instead");
     } else {
-        @compileError("Unknown format string: '" ++ fmt ++ "'");
+        @compileError("Unsupported format string '" ++ fmt ++ "' for type '" ++ @typeName(@TypeOf(value)) ++ "'");
     }
 }
 
